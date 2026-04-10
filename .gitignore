@@ -1,0 +1,19 @@
+# 编译生成的文件
+build/
+*.o
+*.elf
+*.bin
+*.map
+
+# IDE 配置
+.vscode/
+.idea/
+
+# 临时文件
+*.log
+*.bak
+*.swp
+
+# 依赖组件（太大）
+managed_components/
+dependencies.lock
