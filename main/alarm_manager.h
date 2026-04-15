@@ -44,10 +44,13 @@ alarm_t* alarm_manager_get_next(void);
 // 检查闹钟是否到期
 alarm_t* alarm_manager_check_expired(void);
 
-// 获取所有闹钟
 int alarm_manager_get_all(alarm_t *alarms, int max_count);
-
-// 打印所有闹钟（调试用）
 void alarm_manager_print_all(void);
+void alarm_manager_save(void);
+void alarm_manager_load(void);
+void alarm_set_name(int alarm_id, const char *name);
+int alarm_get_pending_id(void);
+void alarm_set_pending(int alarm_id);
+void alarm_clear_pending(void);
 
 #endif

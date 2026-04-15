@@ -176,6 +176,14 @@ esp_err_t start_http_server(void) {
     };
     httpd_register_uri_handler(server, &alarm_delete_uri);
     
+    httpd_uri_t recognition_uri2 = {
+        .uri = "/api/api/recognition",
+        .method = HTTP_GET,
+        .handler = recognition_get_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &recognition_uri2);
+
     ESP_LOGI(TAG, "HTTP 服务器已启动");
     return ESP_OK;
 }
