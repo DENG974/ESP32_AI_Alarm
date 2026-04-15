@@ -4,9 +4,9 @@
 #include "esp_err.h"
 
 // 百度API配置
-#define BAIDU_APP_ID     ""
-#define BAIDU_API_KEY    "" 
-#define BAIDU_SECRET_KEY ""
+#define BAIDU_APP_ID     "7526759"
+#define BAIDU_API_KEY    "ZwlqEH5L39IBuyH3HJURBlLQ" 
+#define BAIDU_SECRET_KEY "lPJc0yQB7c5DWqQhSgx7JwLukTW5eQXm"
 
 // 初始化百度ASR
 esp_err_t baidu_asr_init(void);

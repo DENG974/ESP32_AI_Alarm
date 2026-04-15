@@ -11,6 +11,8 @@
 #include "baidu_asr.h"
 #include "audio_recorder.h"
 #include "esp_http_client.h"
+#include "http_server.h"
+#include "esp_netif.h"
 
 // 引脚定义
 #define MIC_WS_PIN  25
@@ -27,30 +29,6 @@
 
 static const char *TAG = "ALARM";
 static i2s_chan_handle_t mic = NULL, spk = NULL;
-
-// Pending alarm name capture
-#define PENDING_NAME_TIMEOUT_MS 8000
-static bool s_pending_alarm = false;
-static time_t s_pending_trigger = 0;
-static TickType_t s_pending_deadline = 0;
-
-static void finalize_pending_alarm(const char *name) {
-    const char *use_name = (name && name[0]) ? name : "默认闹钟";
-    int alarm_id = alarm_manager_add_epoch(s_pending_trigger, use_name);
-    if (alarm_id > 0) {
-        struct tm *t = localtime(&s_pending_trigger);
-        ESP_LOGI(TAG, "闹钟已设置: %02d:%02d:%02d - %s",
-                 t->tm_hour, t->tm_min, t->tm_sec, use_name);
-    }
-    s_pending_alarm = false;
-}
-
-static void check_pending_alarm_timeout(void) {
-    if (!s_pending_alarm) return;
-    if (xTaskGetTickCount() >= s_pending_deadline) {
-        finalize_pending_alarm("默认闹钟");
-    }
-}
 
 // ========== I2S 初始化 ==========
 static esp_err_t i2s_init_rx(i2s_chan_handle_t *handle, int bclk, int ws, int din) {
@@ -211,48 +189,13 @@ void play_audio(int16_t *audio, int samples) {
 
 // 解析命令
 void parse(const char *text) {
-    if (!text) return;
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "%s", text);
+    char cmd[64];
+    strcpy(cmd, text);
     int len = strlen(cmd);
     if (len > 0 && cmd[len-1] == '。') {
         cmd[len-1] = '\0';
     }
     
-    for (int i = 0; cmd[i]; i++) {
-            if (cmd[i] == '.') {
-                cmd[i] = '点';
-            }
-        }
-
-    // ========== 0. Pending name capture ==========
-    if (s_pending_alarm) {
-        if (xTaskGetTickCount() < s_pending_deadline) {
-            // Use the whole utterance as the alarm name
-            finalize_pending_alarm(cmd);
-            return;
-        } else {
-            finalize_pending_alarm("默认闹钟");
-        }
-    }
-
-    // ========== 0.1 显示所有闹钟 ==========
-    if (strstr(cmd, "显示") || strstr(cmd, "闹钟")) {
-        alarm_t list[MAX_ALARMS];
-        int count = alarm_manager_get_all(list, MAX_ALARMS);
-        if (count == 0) {
-            ESP_LOGI(TAG, "当前没有闹钟");
-        } else {
-            ESP_LOGI(TAG, "=== 闹钟列表 (%d) ===", count);
-            for (int i = 0; i < count; i++) {
-                struct tm *t = localtime(&list[i].trigger_time);
-                ESP_LOGI(TAG, "ID=%d  时间=%02d:%02d  名称=%s",
-                         list[i].id, t->tm_hour, t->tm_min, list[i].message);
-            }
-        }
-        return;
-    }
-
     // ========== 1. 询问时间 ==========
     if (strstr(cmd, "几点") || strstr(cmd, "什么时间") || strstr(cmd, "几点了")) {
         time_t now = time(NULL);
@@ -267,77 +210,69 @@ void parse(const char *text) {
         return;
     }
     
-    // ========== 2. 绝对时间闹钟 ==========
-    if (strstr(cmd, "点")) {
+    // ========== 2. 绝对时间闹钟（先处理，避免被分钟匹配）==========
+    // 匹配格式：16点40分提醒我、下午3点提醒我、3点提醒我
+    if ((strstr(cmd, "点") || strstr(cmd, "时")) && (strstr(cmd, "提醒") || strstr(cmd, "闹钟"))) {
         int hour = 0, minute = 0;
+        int is_pm = 0;
         
-        // 方法：直接在字符串中搜索数字
-        const char *p = cmd;
-        while (*p) {
+        // 检查上午/下午
+        if (strstr(cmd, "下午") || strstr(cmd, "晚上")) {
+            is_pm = 1;
+        }
+        if (strstr(cmd, "上午") || strstr(cmd, "早上")) {
+            is_pm = 0;
+        }
+        
+        // 提取小时
+        for (const char *p = cmd; *p; p++) {
             if (*p >= '0' && *p <= '9') {
                 hour = atoi(p);
-                // 找到数字后，找到"点"的位置
-                const char *dot = strstr(p, "点");
-                if (dot) {
-                    // 在"点"后面找分钟数字
-                    const char *min_start = dot + 1;
-                    while (*min_start && (*min_start < '0' || *min_start > '9')) {
-                        min_start++;
-                    }
-                    if (*min_start >= '0' && *min_start <= '9') {
-                        minute = atoi(min_start);
+                // 跳过数字
+                while (*p >= '0' && *p <= '9') p++;
+                // 找分钟
+                if (*p == '点' || *p == '时') {
+                    p++;
+                    while (*p && (*p < '0' || *p > '9')) p++;
+                    if (*p >= '0' && *p <= '9') {
+                        minute = atoi(p);
                     }
                 }
                 break;
             }
-            p++;
         }
         
-        // 如果小时有效，设置闹钟
-        if (hour > 0 && hour <= 24) {
-            char message[64] = "闹钟";
-            const char *msg_start = strstr(cmd, "提醒");
-            if (msg_start) {
-                msg_start += 6;
-                int msg_len = 0;
-                while (msg_start[msg_len] && msg_start[msg_len] != '。') {
-                    message[msg_len] = msg_start[msg_len];
-                msg_len++;
-                if (msg_len >= (int)sizeof(message) - 1) break;
-                }
-                message[msg_len] = '\0';
-                if (strcmp(message, "我") == 0 || strlen(message) == 0) {
-                    strcpy(message, "闹钟");
-                }
-            }
-
-            if (!msg_start || strcmp(message, "闹钟") == 0) {
-                // Ask for a name
-                s_pending_alarm = true;
-                time_t now = time(NULL);
-                struct tm *ti = localtime(&now);
-                ti->tm_hour = hour;
-                ti->tm_min = minute;
-                ti->tm_sec = 0;
-                time_t target = mktime(ti);
-                if (target <= now) {
-                    target += 24 * 3600;
-                }
-                s_pending_trigger = target;
-                s_pending_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(PENDING_NAME_TIMEOUT_MS);
-                ESP_LOGI(TAG, "%d点%d分做什么?", hour, minute);
-                return;
-            } else {
-                int alarm_id = alarm_manager_add_absolute(hour, minute, message);
-                if (alarm_id > 0) {
-                    ESP_LOGI(TAG, "闹钟已设置: %d点%d分 - %s", hour, minute, message);
-                }
-                return;
-            }
+        // 处理下午时间
+        if (is_pm && hour > 0 && hour < 12) {
+            hour += 12;
         }
+        
+        // 提取提醒内容
+        char message[64] = "闹钟";
+        const char *msg_start = strstr(cmd, "提醒");
+        if (msg_start) {
+            msg_start += 6; // 跳过"提醒"
+            int msg_len = 0;
+            while (msg_start[msg_len] && msg_start[msg_len] != '。') {
+                message[msg_len] = msg_start[msg_len];
+                msg_len++;
+            }
+            message[msg_len] = '\0';
+            if (strlen(message) == 0) strcpy(message, "闹钟");
+        }
+        
+        if (hour >= 1 && hour <= 24) {
+            int alarm_id = alarm_manager_add_absolute(hour, minute, message);
+            if (alarm_id > 0) {
+                ESP_LOGI(TAG, "闹钟已设置: %d点%d分 - %s", hour, minute, message);
+            }
+        } else {
+            ESP_LOGW(TAG, "无法解析时间: %s", cmd);
+        }
+        return;
     }
     
-    // ========== 3. 相对时间闹钟 ==========
+    // ========== 3. 相对时间闹钟（X分钟后/小时后/秒后）==========
     int num = 0;
     for (const char *p = cmd; *p; p++) {
         if (*p >= '0' && *p <= '9') {
@@ -349,52 +284,21 @@ void parse(const char *text) {
     if (num == 0) num = 3;
     
     if (strstr(cmd, "分钟") || strstr(cmd, "分")) {
-        s_pending_alarm = true;
-        time_t now = time(NULL);
-        if (now == 0) {
-            struct timeval tv;
-            gettimeofday(&tv, NULL);
-            now = tv.tv_sec;
-        }
-        time_t target = now + num * 60;
-        s_pending_trigger = target;
-        s_pending_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(PENDING_NAME_TIMEOUT_MS);
-        ESP_LOGI(TAG, "%d分钟后做什么?", num);
-        return;
+        alarm_manager_add_relative(num, TIME_UNIT_MINUTES, "闹钟");
+        ESP_LOGI(TAG, "闹钟: %d分钟后", num);
     }
     else if (strstr(cmd, "小时") || strstr(cmd, "时")) {
-        s_pending_alarm = true;
-        time_t now = time(NULL);
-        if (now == 0) {
-            struct timeval tv;
-            gettimeofday(&tv, NULL);
-            now = tv.tv_sec;
-        }
-        time_t target = now + num * 3600;
-        s_pending_trigger = target;
-        s_pending_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(PENDING_NAME_TIMEOUT_MS);
-        ESP_LOGI(TAG, "%d小时后做什么?", num);
-        return;
+        alarm_manager_add_relative(num, TIME_UNIT_HOURS, "闹钟");
+        ESP_LOGI(TAG, "闹钟: %d小时后", num);
     }
     else if (strstr(cmd, "秒")) {
-        s_pending_alarm = true;
-        time_t now = time(NULL);
-        if (now == 0) {
-            struct timeval tv;
-            gettimeofday(&tv, NULL);
-            now = tv.tv_sec;
-        }
-        time_t target = now + num;
-        s_pending_trigger = target;
-        s_pending_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(PENDING_NAME_TIMEOUT_MS);
-        ESP_LOGI(TAG, "%d秒后做什么?", num);
-        return;
+        alarm_manager_add_relative(num, TIME_UNIT_SECONDS, "闹钟");
+        ESP_LOGI(TAG, "闹钟: %d秒后", num);
     }
     else {
         ESP_LOGW(TAG, "无法识别: %s", text);
     }
 }
-
 // 计算音量
 uint32_t volume(const int16_t *buf, int len) {
     uint32_t sum = 0;
@@ -452,6 +356,7 @@ void voice_task(void *pv) {
                         beep(880, 80, 8000);
                         beep(1320, 80, 8000);
                         ESP_LOGI(TAG, "识别结果: %s", result);
+                        set_latest_recognition(result);
                         parse(result);
                         free(result);
                     } else {
@@ -479,7 +384,6 @@ void voice_task(void *pv) {
 
 void alarm_task(void *pv) {
     while (1) {
-        check_pending_alarm_timeout();
         alarm_t *a = alarm_manager_check_expired();
         if (a) {
             for (int i = 0; i < 5; i++) {
@@ -494,7 +398,9 @@ void alarm_task(void *pv) {
     }
 }
 
-void app_main(void) {    
+void app_main(void) {
+    ESP_LOGI(TAG, "AI闹钟启动");
+    
     // 初始化NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -521,18 +427,30 @@ void app_main(void) {
     
     // 连接WiFi
     wifi_init_sta();
-    wifi_wait_connected(pdMS_TO_TICKS(10000));
-
+    esp_err_t wifi_ret = wifi_wait_connected(pdMS_TO_TICKS(10000));
+    
+    if (wifi_ret == ESP_OK) {
+        start_http_server();
+        
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif) {
+            esp_netif_ip_info_t ip_info;
+            esp_netif_get_ip_info(netif, &ip_info);
+            ESP_LOGI(TAG, "ESP32 IP: " IPSTR, IP2STR(&ip_info.ip));
+        }
+        
+        // 初始化百度ASR
+        baidu_asr_init();
+        ESP_LOGI(TAG, "WiFi已连接，语音识别就绪");
+    } else {
+        ESP_LOGW(TAG, "WiFi连接失败，语音识别不可用");
+    }
+    
+    // 等待时间同步
+    vTaskDelay(pdMS_TO_TICKS(2000));
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
     ESP_LOGI(TAG, "当前时间: %02d:%02d:%02d", tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
-    
-    
-    // 简单延时等待网络稳定
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    
-    // 初始化百度ASR
-    baidu_asr_init();
     
     // 创建任务
     xTaskCreate(voice_task, "voice", 8192, NULL, 5, NULL);

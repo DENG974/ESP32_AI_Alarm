@@ -6,8 +6,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define WIFI_SSID      ""
-#define WIFI_PASS      ""
+#define WIFI_SSID      "iPhone"
+#define WIFI_PASS      "1234567800"
 #define WIFI_MAX_RETRY 5
 
 esp_err_t wifi_init_sta(void);
